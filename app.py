@@ -8,7 +8,7 @@ import streamlit as st
 
 from ts_analyzer.basic_statistics import correlation_matrix, numeric_summary
 from ts_analyzer.data_loader import find_bundled_workbook, load_excel_timeseries, workbook_sheet_names
-from ts_analyzer.selection import filter_time_window, selected_time_range
+from ts_analyzer.selection import clamp_time_range, filter_time_window, selected_time_range
 from ts_analyzer.time_series_statistics import derivative, rolling_statistics, sampling_statistics
 from ts_analyzer.visualization import (
     build_boxplot,
@@ -109,8 +109,9 @@ trend_tab, ts_tab, data_tab = st.tabs(["Trend Explorer", "Time-Series Statistics
 with trend_tab:
     st.subheader("Trend Explorer")
     st.caption(
-        "Use the box-select tool on the trend to define the analysis interval. "
-        "The table, box plot and correlation below update from that selected time window."
+        "Use box selection on the trend to zoom into an interval. The trend itself, "
+        "statistics, box plot and correlation all update to that active interval. "
+        "You can repeatedly select a smaller interval to drill down."
     )
 
     default_signals = signals[: min(4, len(signals))]
@@ -126,9 +127,58 @@ with trend_tab:
             horizontal=True,
         )
 
+    # Keep our own writable analysis window. Streamlit's Plotly selection state is
+    # read-only, so the callback copies each selection into these session keys.
+    base_min = base_df["Timestamp"].min()
+    base_max = base_df["Timestamp"].max()
+
+    if "trend_active_start" not in st.session_state:
+        st.session_state.trend_active_start = base_min
+    if "trend_active_end" not in st.session_state:
+        st.session_state.trend_active_end = base_max
+
+    active_start, active_end = clamp_time_range(
+        st.session_state.trend_active_start,
+        st.session_state.trend_active_end,
+        base_min,
+        base_max,
+    )
+    st.session_state.trend_active_start = active_start
+    st.session_state.trend_active_end = active_end
+
+    def apply_trend_selection():
+        event_state = st.session_state.get("main_trend")
+        chosen = selected_time_range(event_state)
+        if chosen is not None:
+            new_start, new_end = clamp_time_range(chosen[0], chosen[1], base_min, base_max)
+            # Ignore a degenerate one-sample/one-timestamp selection.
+            if new_end > new_start:
+                st.session_state.trend_active_start = new_start
+                st.session_state.trend_active_end = new_end
+
+    def reset_trend_window():
+        st.session_state.trend_active_start = base_min
+        st.session_state.trend_active_end = base_max
+
     if not selected_signals:
         st.info("Select at least one signal.")
     else:
+        active_df = filter_time_window(base_df, active_start, active_end)
+        if active_df.empty:
+            active_df = base_df
+            active_start, active_end = base_min, base_max
+            st.session_state.trend_active_start = active_start
+            st.session_state.trend_active_end = active_end
+
+        top_left, top_right = st.columns([4, 1])
+        with top_left:
+            st.caption(
+                f"Active trend window: **{active_start} → {active_end}** "
+                f"({len(active_df):,} samples)"
+            )
+        with top_right:
+            st.button("Reset trend window", on_click=reset_trend_window, use_container_width=True)
+
         axis_map = {}
         if trend_mode == "Separate overlay y-axes":
             max_groups = min(4, len(selected_signals))
@@ -142,45 +192,35 @@ with trend_tab:
                         index=min(idx, max_groups - 1),
                         key=f"axis_group_{signal}",
                     )
-            trend_fig = build_overlay_multi_axis_trend(base_df, selected_signals, axis_map, normalize_trend)
+            trend_fig = build_overlay_multi_axis_trend(active_df, selected_signals, axis_map, normalize_trend)
         elif trend_mode == "Stacked subplots":
-            trend_fig = build_stacked_trend(base_df, selected_signals, normalize_trend)
+            trend_fig = build_stacked_trend(active_df, selected_signals, normalize_trend)
         else:
-            trend_fig = build_shared_axis_trend(base_df, selected_signals, normalize_trend)
+            trend_fig = build_shared_axis_trend(active_df, selected_signals, normalize_trend)
 
-        event = st.plotly_chart(
+        # The callback executes before the rerun body, so the newly selected range
+        # is already in trend_active_start/end when the figure is rebuilt.
+        st.plotly_chart(
             trend_fig,
-            use_container_width=True,
+            width="stretch",
             key="main_trend",
-            on_select="rerun",
+            on_select=apply_trend_selection,
             selection_mode=("box",),
+            config={"scrollZoom": True, "displaylogo": False},
         )
 
-        selected_range = selected_time_range(event)
-        if selected_range is None:
-            analysis_df = base_df
-            selection_label = "Base sidebar time window"
-        else:
-            analysis_df = filter_time_window(base_df, selected_range[0], selected_range[1])
-            selection_label = f"{selected_range[0]} → {selected_range[1]}"
-
-        if analysis_df.empty:
-            st.warning("The current chart selection contains no samples. Using the base sidebar time window instead.")
-            analysis_df = base_df
-            selection_label = "Base sidebar time window"
-
+        analysis_df = active_df
         sel_span = analysis_df["Timestamp"].max() - analysis_df["Timestamp"].min() if len(analysis_df) else pd.Timedelta(0)
         s1, s2, s3 = st.columns(3)
         s1.metric("Analyzed samples", f"{len(analysis_df):,}")
         s2.metric("Analyzed span", str(sel_span).split(".")[0])
         s3.metric("Selected signals", len(selected_signals))
-        st.caption(f"Statistics window: **{selection_label}**")
 
         st.markdown("### Dynamic signal statistics")
         summary = numeric_summary(analysis_df, selected_signals)
         st.dataframe(
             summary,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Missing %": st.column_config.NumberColumn(format="%.2f"),
@@ -199,15 +239,15 @@ with trend_tab:
         normalize_box = st.checkbox("Normalize box plot (z-score)", value=False)
         st.plotly_chart(
             build_boxplot(analysis_df, selected_signals, normalize_box),
-            use_container_width=True,
+            width="stretch",
             key="dynamic_boxplot",
         )
 
         if len(selected_signals) >= 2:
-            with st.expander("Correlation for selected interval", expanded=False):
+            with st.expander("Correlation for active interval", expanded=False):
                 corr = correlation_matrix(analysis_df, selected_signals)
-                st.plotly_chart(build_correlation_heatmap(corr), use_container_width=True, key="dynamic_corr")
-                st.dataframe(corr.round(4), use_container_width=True)
+                st.plotly_chart(build_correlation_heatmap(corr), width="stretch", key="dynamic_corr")
+                st.dataframe(corr.round(4), width="stretch")
 
 with ts_tab:
     st.subheader("Time-Series Statistics")
